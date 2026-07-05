@@ -24,11 +24,11 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 
-TON_ADDRESS = os.environ.get("TON_ADDRESS", "")          # your TON receiver
-TRON_ADDRESS = os.environ.get("TRON_ADDRESS", "")        # your USDT-TRC20 receiver
-TONCENTER_KEY = os.environ.get("TONCENTER_API_KEY", "")  # optional (higher limits)
-TRONGRID_KEY = os.environ.get("TRONGRID_API_KEY", "")    # optional
-STARS_PER_USD = int(os.environ.get("STARS_PER_USD", "65"))  # tune to real Star rate
+TON_ADDRESS = os.environ.get("TON_ADDRESS", "")
+TRON_ADDRESS = os.environ.get("TRON_ADDRESS", "")
+TONCENTER_KEY = os.environ.get("TONCENTER_API_KEY", "")
+TRONGRID_KEY = os.environ.get("TRONGRID_API_KEY", "")
+STARS_PER_USD = int(os.environ.get("STARS_PER_USD", "65"))
 
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
@@ -55,13 +55,33 @@ else:
     ai_client, AI_MODEL, AI_PROVIDER = None, None, None
 
 POST_CATEGORIES = [
-    ("why", "Explain WHY this topic matters. Positive and motivating. 2-3 short paragraphs."),
+    ("why", "Explain WHY this topic matters. Positive and motivating."),
     ("important", "Share an IMPORTANT concept everyone should know. Educational."),
-    ("history", "Tell a short HISTORICAL fact or background story. Engaging."),
+    ("history", "Tell a HISTORICAL fact or background story. Engaging."),
     ("fun fact", "Share a surprising FUN FACT. Make people say 'wow'."),
     ("quiz", "Create a QUIZ with 4 options (A,B,C,D) and reveal the answer with a short explanation."),
-    ("tips", "Give 3-5 practical TIPS as a numbered list."),
+    ("tips", "Give practical TIPS people can use right away."),
 ]
+
+STYLES = [
+    "storytelling narrative",
+    "bold and punchy with very short lines",
+    "conversational, like texting a friend",
+    "a numbered listicle",
+    "question-and-answer format",
+    "myth vs fact — bust a common misconception",
+    "a quick step-by-step mini guide",
+    "a surprising 'did you know' angle",
+    "motivational and inspiring",
+    "explained with a simple analogy or metaphor",
+]
+
+LENGTHS = {
+    "short":  "SHORT post: 1-3 punchy sentences, under 300 characters — a scroll-stopping hook.",
+    "medium": "MEDIUM post: 1-2 short paragraphs, 300-600 characters.",
+    "long":   "LONG-FORM post: 3-5 short paragraphs or a detailed numbered list, 800-1200 characters, genuinely in-depth and valuable.",
+}
+LENGTH_POOL = ["short", "short", "short", "medium", "medium", "medium", "long", "long"]
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +98,7 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS channels (
         id BIGINT PRIMARY KEY, owner_id BIGINT, title TEXT, topic TEXT,
-        category_index INT DEFAULT 0, active BOOLEAN DEFAULT false,
+        category_index INT DEFAULT 0, active BOOLEAN DEFAULT false, linked BOOLEAN DEFAULT true,
         posts_today INT DEFAULT 0, last_post_date TEXT, next_post_time TIMESTAMPTZ,
         trial_start TIMESTAMPTZ, subscription_until TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT now()
@@ -88,7 +108,13 @@ def init_db():
         currency TEXT, expected_amount NUMERIC, address TEXT, status TEXT DEFAULT 'pending',
         tx_hash TEXT, created_at TIMESTAMPTZ DEFAULT now(), expires_at TIMESTAMPTZ
     );
+    CREATE TABLE IF NOT EXISTS posts (
+        id SERIAL PRIMARY KEY, channel_id BIGINT, category TEXT, style TEXT,
+        content TEXT, created_at TIMESTAMPTZ DEFAULT now()
+    );
     """)
+    # migration for already-deployed DBs
+    cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked BOOLEAN DEFAULT true;")
     c.commit(); cur.close(); c.close()
     logger.info("DB ready.")
 
@@ -99,15 +125,20 @@ def ensure_user(uid, name):
 
 # ---- channels ----
 def add_channel(owner_id, cid, title):
+    """Re-links the channel WITHOUT resetting trial_start / subscription_until."""
     now = datetime.now(timezone.utc)
     c = dbc(); cur = c.cursor()
-    cur.execute("""INSERT INTO channels (id, owner_id, title, trial_start) VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, owner_id=EXCLUDED.owner_id""",
+    cur.execute("""INSERT INTO channels (id, owner_id, title, trial_start, linked)
+                   VALUES (%s,%s,%s,%s,true)
+                   ON CONFLICT (id) DO UPDATE
+                     SET title=EXCLUDED.title, owner_id=EXCLUDED.owner_id, linked=true""",
                 (cid, owner_id, title, now))
     c.commit(); cur.close(); c.close()
 
 def remove_channel(cid):
-    c = dbc(); cur = c.cursor(); cur.execute("DELETE FROM channels WHERE id=%s", (cid,))
+    """Unlink (keep billing memory) instead of deleting."""
+    c = dbc(); cur = c.cursor()
+    cur.execute("UPDATE channels SET linked=false, active=false WHERE id=%s", (cid,))
     c.commit(); cur.close(); c.close()
 
 def update_channel(cid, **f):
@@ -119,7 +150,7 @@ def update_channel(cid, **f):
 
 def get_user_channels(owner_id):
     c = dbc(); cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM channels WHERE owner_id=%s ORDER BY created_at", (owner_id,))
+    cur.execute("SELECT * FROM channels WHERE owner_id=%s AND linked=true ORDER BY created_at", (owner_id,))
     rows = cur.fetchall(); cur.close(); c.close()
     return [dict(r) for r in rows]
 
@@ -131,7 +162,7 @@ def find_channel(cid):
 
 def all_active_channels():
     c = dbc(); cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM channels WHERE active=true AND topic IS NOT NULL")
+    cur.execute("SELECT * FROM channels WHERE active=true AND linked=true AND topic IS NOT NULL")
     rows = cur.fetchall(); cur.close(); c.close()
     return [dict(r) for r in rows]
 
@@ -161,6 +192,23 @@ def channel_status_text(ch):
         left = (ch["trial_start"] + timedelta(hours=TRIAL_HOURS)) - now
         return f"🎁 Trial — {left.seconds//3600}h {(left.seconds//60)%60}m left"
     return "⛔ Expired — subscribe to post"
+
+# ---- post memory ----
+def save_post(channel_id, category, style, content):
+    c = dbc(); cur = c.cursor()
+    cur.execute("INSERT INTO posts (channel_id, category, style, content) VALUES (%s,%s,%s,%s)",
+                (channel_id, category, style, content))
+    cur.execute("""DELETE FROM posts WHERE channel_id=%s AND id NOT IN (
+                     SELECT id FROM posts WHERE channel_id=%s ORDER BY id DESC LIMIT 50)""",
+                (channel_id, channel_id))
+    c.commit(); cur.close(); c.close()
+
+def get_recent_gists(channel_id, limit=12):
+    c = dbc(); cur = c.cursor()
+    cur.execute("SELECT content FROM posts WHERE channel_id=%s ORDER BY id DESC LIMIT %s",
+                (channel_id, limit))
+    rows = cur.fetchall(); cur.close(); c.close()
+    return [" ".join(content.split())[:120] for (content,) in rows]
 
 # ---- orders ----
 def pending_amount_exists(currency, amount):
@@ -210,18 +258,34 @@ def mark_order_paid(oid, tx_hash):
     c.commit(); cur.close(); c.close()
 
 # ---------- AI ----------
-async def generate_post(topic, category, instructions):
+async def generate_post(topic, category, instructions, style, length_desc, recent_gists):
     if not ai_client:
         return None
-    sysp = (f"You create Telegram channel posts about: '{topic}'. "
-            "Keep content advertiser-friendly and compliant: no gambling/adult content, no financial "
-            "guarantees or 'get rich' claims, no hate or misinformation, safe for all audiences. "
-            "Light emojis, under 800 characters, no hashtags unless natural, no greeting or sign-off.")
-    usrp = f"Write a Telegram post for category: {category.upper()}.\n\n{instructions}\n\nTopic: {topic}"
+    avoid = ""
+    if recent_gists:
+        joined = "\n".join(f"- {g}" for g in recent_gists)
+        avoid = ("\n\n⚠️ You have ALREADY posted the following recently. Produce something CLEARLY "
+                 f"DIFFERENT — a new angle, new examples, new wording. Do NOT repeat these:\n{joined}")
+    sysp = (
+        f"You are an expert Telegram content creator for a channel about: '{topic}'. "
+        "Every post must feel FRESH and unique — never recycle the same facts or phrasing. "
+        "Each time, pick a NEW specific angle, sub-topic, or example. "
+        "Keep it advertiser-friendly and compliant: no gambling/adult content, no financial "
+        "guarantees or 'get rich' claims, no hate or misinformation, safe for all audiences. "
+        "Use light emojis, no hashtags unless natural, no greeting or sign-off."
+    )
+    usrp = (
+        f"Write a {length_desc}\n\n"
+        f"WRITING STYLE: {style}.\n"
+        f"CONTENT TYPE: {category.upper()} — {instructions}\n"
+        f"CHANNEL TOPIC: {topic}"
+        f"{avoid}"
+    )
     try:
         r = await ai_client.chat.completions.create(
-            model=AI_MODEL, messages=[{"role": "system", "content": sysp}, {"role": "user", "content": usrp}],
-            temperature=0.9, max_tokens=600)
+            model=AI_MODEL,
+            messages=[{"role": "system", "content": sysp}, {"role": "user", "content": usrp}],
+            temperature=1.0, max_tokens=900)
         return r.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI error: {e}")
@@ -277,9 +341,9 @@ def channel_detail(ch):
 
 def plan_markup(cid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"1 Day — $2", callback_data=f"cur:{cid}:daily")],
-        [InlineKeyboardButton(f"1 Week — $10", callback_data=f"cur:{cid}:weekly")],
-        [InlineKeyboardButton(f"1 Month — $30", callback_data=f"cur:{cid}:monthly")],
+        [InlineKeyboardButton("1 Day — $2", callback_data=f"cur:{cid}:daily")],
+        [InlineKeyboardButton("1 Week — $10", callback_data=f"cur:{cid}:weekly")],
+        [InlineKeyboardButton("1 Month — $30", callback_data=f"cur:{cid}:monthly")],
         [InlineKeyboardButton("⬅️ Back", callback_data=f"channel:{cid}")],
     ])
 
@@ -298,7 +362,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 Hi {u.first_name}!\n\n🤖 *AI Channel Auto-Poster*\n\n"
         f"I post {POSTS_PER_DAY}× per day of fresh, approval-friendly content to your channel — "
-        f"rotating through 💡 Why • ⭐ Important • 📜 History • 🎉 Fun Fact • ❓ Quiz • 💪 Tips.\n\n"
+        f"varying length and style, and never repeating myself.\n\n"
         f"🎁 Each channel gets a *free 24h trial*, then $2/day, $10/week, or $30/month.\n\n"
         f"Add me as *admin* to a channel to begin.\n\n_Powered by {AI_PROVIDER or 'AI'}_"
     )
@@ -310,7 +374,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Add me as *Admin* to your channel (with Post Messages)\n"
         "2️⃣ I detect it automatically\n"
         "3️⃣ Set the topic\n"
-        f"4️⃣ Activate — I post {POSTS_PER_DAY}×/day\n\n"
+        f"4️⃣ Activate — I post {POSTS_PER_DAY}×/day in varied styles & lengths\n\n"
         "🎁 *Free 24h trial per channel.* Then subscribe that channel:\n"
         "• $2 / day\n• $10 / week\n• $30 / month\n"
         "Pay with ⭐ Stars, TON, or USDT.\n\n"
@@ -348,16 +412,20 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
     if cmu.new_chat_member.status == "administrator":
         ensure_user(actor.id, actor.first_name)
         add_channel(actor.id, cmu.chat.id, cmu.chat.title or "Untitled")
+        ch = find_channel(cmu.chat.id)
+        msg = f"✅ Channel *{cmu.chat.title}* linked!\n\n"
+        if channel_has_access(ch):
+            msg += "Set its topic to begin."
+        else:
+            msg += f"{channel_status_text(ch)}\nSet its topic, then subscribe to post."
         try:
-            await context.bot.send_message(
-                actor.id, f"✅ Channel *{cmu.chat.title}* linked! Free 24h trial started.\n\nSet its topic to begin.",
-                reply_markup=main_menu(actor.id), parse_mode="Markdown")
+            await context.bot.send_message(actor.id, msg, reply_markup=main_menu(actor.id), parse_mode="Markdown")
         except Exception:
             pass
     elif cmu.new_chat_member.status in ("left", "kicked", "member"):
         remove_channel(cmu.chat.id)
         try:
-            await context.bot.send_message(actor.id, f"⚠️ Removed *{cmu.chat.title}* (lost admin).", parse_mode="Markdown")
+            await context.bot.send_message(actor.id, f"⚠️ Unlinked *{cmu.chat.title}* (lost admin). Your trial/subscription is remembered if you re-add me.", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -425,13 +493,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("pay:"):
         _, cid, plan, cur = data.split(":")
-        cid = int(cid)
-        await handle_pay(context, q, uid, cid, plan, cur)
+        await handle_pay(context, q, uid, int(cid), plan, cur)
         return
 
     if data.startswith("check:"):
-        oid = int(data.split(":")[1])
-        await check_order_now(context, q, oid)
+        await check_order_now(context, q, int(data.split(":")[1]))
         return
 
     if data.startswith("postnow:"):
@@ -446,7 +512,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("remove:"):
         remove_channel(int(data.split(":")[1]))
-        await q.edit_message_text("🗑 Removed.", reply_markup=main_menu(uid))
+        await q.edit_message_text("🗑 Removed from your list. (Trial/subscription remembered if you re-add.)",
+                                  reply_markup=main_menu(uid))
         return
 
 async def handle_pay(context, q, uid, cid, plan, cur):
@@ -613,7 +680,7 @@ async def crypto_loop(app):
 # ---------- POSTING ----------
 async def do_post(context, cid, force=False):
     ch = find_channel(cid)
-    if not ch or not ch["topic"]:
+    if not ch or not ch["topic"] or not ch.get("linked", True):
         return
     if not channel_has_access(ch):
         if ch["active"]:
@@ -625,21 +692,51 @@ async def do_post(context, cid, force=False):
             except Exception:
                 pass
         return
+
     idx = ch["category_index"] % len(POST_CATEGORIES)
     cat_name, cat_instr = POST_CATEGORIES[idx]
-    content = await generate_post(ch["topic"], cat_name, cat_instr)
+
+    style = random.choice(STYLES)
+    length_key = random.choice(LENGTH_POOL)
+    if cat_name == "quiz":
+        length_key = "medium"
+    length_desc = LENGTHS[length_key]
+
+    gists = get_recent_gists(cid, limit=12)
+    content = await generate_post(ch["topic"], cat_name, cat_instr, style, length_desc, gists)
     if not content:
         return
     try:
         await context.bot.send_message(cid, content)
     except Exception as e:
-        logger.error(f"post failed {cid}: {e}"); return
+        logger.error(f"post failed {cid}: {e}")
+        return
+
+    save_post(cid, cat_name, style, content)
+
     today = datetime.now(timezone.utc).date().isoformat()
     posts_today = ch["posts_today"] if ch["last_post_date"] == today else 0
     posts_today += 1
     update_channel(cid, category_index=(idx + 1) % len(POST_CATEGORIES),
                    posts_today=posts_today, last_post_date=today,
                    next_post_time=datetime.now(timezone.utc) + timedelta(minutes=INTERVAL_MINUTES))
+
+    filled = int((posts_today / POSTS_PER_DAY) * 10)
+    bar = "🟩" * filled + "⬜" * (10 - filled)
+    pct = int((posts_today / POSTS_PER_DAY) * 100)
+    remaining = max(0, POSTS_PER_DAY - posts_today)
+    preview = content[:140] + ("…" if len(content) > 140 else "")
+    try:
+        await context.bot.send_message(
+            ch["owner_id"],
+            f"✅ *Posted to {ch['title']}*\n"
+            f"🏷 {cat_name}  ·  ✍️ {style}  ·  📏 {length_key}\n\n"
+            f"{bar} {pct}%\n"
+            f"📊 {posts_today}/{POSTS_PER_DAY} today — {remaining} to go\n\n"
+            f"📝 _{preview}_",
+            parse_mode="Markdown")
+    except Exception:
+        pass
 
 async def scheduler_loop(app):
     await asyncio.sleep(10)
