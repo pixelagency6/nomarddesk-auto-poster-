@@ -113,7 +113,6 @@ def init_db():
         content TEXT, created_at TIMESTAMPTZ DEFAULT now()
     );
     """)
-    # migration for already-deployed DBs
     cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked BOOLEAN DEFAULT true;")
     c.commit(); cur.close(); c.close()
     logger.info("DB ready.")
@@ -125,7 +124,6 @@ def ensure_user(uid, name):
 
 # ---- channels ----
 def add_channel(owner_id, cid, title):
-    """Re-links the channel WITHOUT resetting trial_start / subscription_until."""
     now = datetime.now(timezone.utc)
     c = dbc(); cur = c.cursor()
     cur.execute("""INSERT INTO channels (id, owner_id, title, trial_start, linked)
@@ -136,7 +134,6 @@ def add_channel(owner_id, cid, title):
     c.commit(); cur.close(); c.close()
 
 def remove_channel(cid):
-    """Unlink (keep billing memory) instead of deleting."""
     c = dbc(); cur = c.cursor()
     cur.execute("UPDATE channels SET linked=false, active=false WHERE id=%s", (cid,))
     c.commit(); cur.close(); c.close()
@@ -163,6 +160,12 @@ def find_channel(cid):
 def all_active_channels():
     c = dbc(); cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM channels WHERE active=true AND linked=true AND topic IS NOT NULL")
+    rows = cur.fetchall(); cur.close(); c.close()
+    return [dict(r) for r in rows]
+
+def all_channels(limit=50):
+    c = dbc(); cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM channels ORDER BY created_at DESC LIMIT %s", (limit,))
     rows = cur.fetchall(); cur.close(); c.close()
     return [dict(r) for r in rows]
 
@@ -360,7 +363,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     ensure_user(u.id, u.first_name)
     text = (
-        f"👋 Hi {u.first_name}!\n\n🤖 *AI Channel Auto-Poster*\n\n"
+        f"👋 Hi {u.first_name}!\n\n🤖 *PostPilot — your channel on autopilot*\n\n"
         f"I post {POSTS_PER_DAY}× per day of fresh, approval-friendly content to your channel — "
         f"varying length and style, and never repeating myself.\n\n"
         f"🎁 Each channel gets a *free 24h trial*, then $2/day, $10/week, or $30/month.\n\n"
@@ -370,7 +373,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📚 *How it works*\n\n"
+        "📚 *How PostPilot works*\n\n"
         "1️⃣ Add me as *Admin* to your channel (with Post Messages)\n"
         "2️⃣ I detect it automatically\n"
         "3️⃣ Set the topic\n"
@@ -396,10 +399,24 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cid = int(context.args[0]); days = int(context.args[1])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /grant <channel_id> <days>")
+        await update.message.reply_text("Usage: /grant <channel_id> <days>\n\nUse /channels to see IDs.")
         return
     until = grant_channel(cid, days)
     await update.message.reply_text(f"✅ Channel {cid} granted {days}d (until {until.date()}).")
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    rows = all_channels(limit=50)
+    if not rows:
+        await update.message.reply_text("No channels yet.")
+        return
+    lines = []
+    for ch in rows:
+        link = "🔗" if ch.get("linked", True) else "🚫"
+        lines.append(f"{link} `{ch['id']}`\n{ch['title']} — {channel_status_text(ch)}")
+    await update.message.reply_text("📋 *All Channels*\n\n" + "\n\n".join(lines) +
+                                    "\n\n_Tap an ID to copy, then_ `/grant <id> <days>`", parse_mode="Markdown")
 
 # ---------- CHANNEL DETECTION ----------
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -785,6 +802,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("grant", grant_command))
+    app.add_handler(CommandHandler("channels", channels_command))
     app.add_handler(topic_conv)
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
