@@ -112,6 +112,11 @@ def init_db():
         id SERIAL PRIMARY KEY, channel_id BIGINT, category TEXT, style TEXT,
         content TEXT, created_at TIMESTAMPTZ DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS promo_claims (
+        promo_id INT, channel_id BIGINT, claimed_at TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (promo_id, channel_id)
+    );
     """)
     cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked BOOLEAN DEFAULT true;")
     c.commit(); cur.close(); c.close()
@@ -120,6 +125,44 @@ def init_db():
 def ensure_user(uid, name):
     c = dbc(); cur = c.cursor()
     cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET first_name=EXCLUDED.first_name", (uid, name))
+    c.commit(); cur.close(); c.close()
+
+# ---- settings / promo ----
+def get_setting(key, default=None):
+    c = dbc(); cur = c.cursor()
+    cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+    r = cur.fetchone(); cur.close(); c.close()
+    return r[0] if r else default
+
+def set_setting(key, value):
+    c = dbc(); cur = c.cursor()
+    cur.execute("INSERT INTO settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                (key, str(value)))
+    c.commit(); cur.close(); c.close()
+
+def promo_state():
+    active = get_setting("promo_active", "off") == "on"
+    days = int(get_setting("promo_days", "3") or 3)
+    pid = int(get_setting("promo_id", "0") or 0)
+    return active, days, pid
+
+def activate_promo(days):
+    pid = int(get_setting("promo_id", "0") or 0) + 1
+    set_setting("promo_active", "on"); set_setting("promo_days", days); set_setting("promo_id", pid)
+    return pid
+
+def deactivate_promo():
+    set_setting("promo_active", "off")
+
+def already_claimed(pid, cid):
+    c = dbc(); cur = c.cursor()
+    cur.execute("SELECT 1 FROM promo_claims WHERE promo_id=%s AND channel_id=%s", (pid, cid))
+    r = cur.fetchone(); cur.close(); c.close()
+    return r is not None
+
+def record_claim(pid, cid):
+    c = dbc(); cur = c.cursor()
+    cur.execute("INSERT INTO promo_claims (promo_id, channel_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (pid, cid))
     c.commit(); cur.close(); c.close()
 
 # ---- channels ----
@@ -329,10 +372,15 @@ def channel_detail(ch):
     done = ch["posts_today"] if ch["last_post_date"] == today else 0
     filled = int((done / POSTS_PER_DAY) * 10)
     bar = "🟩" * filled + "⬜" * (10 - filled)
-    kb = [
+    rows = [
         [InlineKeyboardButton("✏️ Set Topic", callback_data=f"settopic:{cid}")],
         [InlineKeyboardButton("⏸ Pause" if ch["active"] else "▶️ Activate", callback_data=f"toggle:{cid}")],
         [InlineKeyboardButton("💳 Subscribe this channel", callback_data=f"plan:{cid}")],
+    ]
+    active, pdays, pid = promo_state()
+    if active and not already_claimed(pid, cid):
+        rows.append([InlineKeyboardButton(f"🎁 Claim {pdays} FREE Days", callback_data=f"claim:{cid}")])
+    rows += [
         [InlineKeyboardButton("📝 Post Now (test)", callback_data=f"postnow:{cid}")],
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"channel:{cid}"),
          InlineKeyboardButton("🗑 Remove", callback_data=f"remove:{cid}")],
@@ -340,7 +388,7 @@ def channel_detail(ch):
     ]
     text = (f"📺 *{ch['title']}*\n\n{channel_status_text(ch)}\n\nStatus: {status}\nTopic: {topic}\n\n"
             f"📊 Today: {bar}  {done}/{POSTS_PER_DAY}")
-    return text, InlineKeyboardMarkup(kb)
+    return text, InlineKeyboardMarkup(rows)
 
 def plan_markup(cid):
     return InlineKeyboardMarkup([
@@ -418,6 +466,27 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 *All Channels*\n\n" + "\n\n".join(lines) +
                                     "\n\n_Tap an ID to copy, then_ `/grant <id> <days>`", parse_mode="Markdown")
 
+async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    args = context.args
+    if not args:
+        active, days, pid = promo_state()
+        await update.message.reply_text(
+            f"Promo: {'🟢 ON' if active else '⚪ OFF'} — {days} free days (cycle #{pid})\n\n"
+            "Usage:\n`/promo on 3`  → start a 3-day promo\n`/promo off`  → end it",
+            parse_mode="Markdown")
+        return
+    if args[0].lower() == "on":
+        days = int(args[1]) if len(args) > 1 and args[1].isdigit() else 3
+        pid = activate_promo(days)
+        await update.message.reply_text(f"🎉 Promo ON — {days} free days (cycle #{pid}). Every channel now shows a Claim button.")
+    elif args[0].lower() == "off":
+        deactivate_promo()
+        await update.message.reply_text("⛔ Promo OFF. The Claim button is hidden.")
+    else:
+        await update.message.reply_text("Usage: `/promo on 3` or `/promo off`", parse_mode="Markdown")
+
 # ---------- CHANNEL DETECTION ----------
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmu = update.my_chat_member
@@ -476,6 +545,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["topic_chat_id"] = int(data.split(":")[1])
         await q.message.reply_text("✏️ Send the topic for this channel.\n\nExample: _Teaching English to Arabic speakers, beginner level._", parse_mode="Markdown")
         return WAITING_TOPIC
+
+    if data.startswith("claim:"):
+        cid = int(data.split(":")[1])
+        active, pdays, pid = promo_state()
+        if not active:
+            await q.answer("Promo has ended.", show_alert=True)
+        elif already_claimed(pid, cid):
+            await q.answer("Already claimed for this channel.", show_alert=True)
+        else:
+            grant_channel(cid, pdays)
+            record_claim(pid, cid)
+            await q.answer(f"🎉 {pdays} free days added!", show_alert=True)
+        ch = find_channel(cid)
+        text, kb = channel_detail(ch)
+        try: await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        except Exception: pass
+        return
 
     if data.startswith("toggle:"):
         cid = int(data.split(":")[1]); ch = find_channel(cid)
@@ -803,6 +889,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("grant", grant_command))
     app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CommandHandler("promo", promo_command))
     app.add_handler(topic_conv)
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
